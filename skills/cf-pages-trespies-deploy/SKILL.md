@@ -1,6 +1,8 @@
 ---
 name: cf-pages-trespies-deploy
-description: Deploy a static folder to Cloudflare Pages and bind a *.trespies.dev custom domain — including the two gotchas that cost real time: wrangler's OAuth login CANNOT attach custom domains (you need a scoped API token) and attaching a domain does NOT auto-create its DNS record (you must create the proxied CNAME yourself). Use when "deploy to trespies.dev", "ship this to Cloudflare Pages", "bind a custom subdomain", "publish the POC", or as Phase 4 of poc-tool-forge.
+description: Deploy a static folder to Cloudflare Pages and bind a *.trespies.dev custom domain — including the three gotchas that cost real time: wrangler's OAuth login CANNOT attach custom domains (you need a scoped API token), attaching a domain does NOT auto-create its DNS record (you must create the proxied CNAME yourself), and `pages deploy <dir>` ships every file in that directory — CLAUDE.md and README.md included — unless you stage it first. Use when "deploy to trespies.dev", "ship this to Cloudflare Pages", "bind a custom subdomain", "publish the POC", or as Phase 4 of poc-tool-forge.
+model: sonnet
+category: agent-orchestration
 ---
 
 > **OpenClaw Integration:** This skill is invoked by the Dojo Genesis plugin via `/dojo run cf-pages-trespies-deploy`.
@@ -11,7 +13,7 @@ description: Deploy a static folder to Cloudflare Pages and bind a *.trespies.de
 # cf-pages-trespies-deploy — static folder → live *.trespies.dev
 
 Ships a static folder (e.g. `trespies-poc/<slug>/`) as its own Cloudflare Pages project with a
-`<slug>.trespies.dev` vanity domain. Encodes the exact sequence + the two non-obvious failures we hit.
+`<slug>.trespies.dev` vanity domain. Encodes the exact sequence + the three non-obvious failures we hit.
 Part of `poc-tool-forge`. Deploying is outward-facing — proceed when the operator has asked to deploy.
 
 ## Constants (not secrets — safe to reference)
@@ -19,7 +21,7 @@ Part of `poc-tool-forge`. Deploying is outward-facing — proceed when the opera
 - `trespies.dev` zone ID: `087d1af3cd36cd575d7473c4f18de9d7`
 - Existing Pages projects on this account include trespies-dev (dash.trespies.dev), and the POC
   projects: quorum, counterclock, body-almanac, ip-scout, hey-matt (matt.trespies.dev),
-  phenotype-draft, contagion, bodyglossary.
+  phenotype-draft, contagion, bodyglossary, taller-abierto.
 
 ## Prerequisite — the scoped API token (the #1 gotcha)
 `wrangler` authenticates via an **OAuth** token, which `wrangler pages deploy` accepts but the public
@@ -30,6 +32,9 @@ so you need a **scoped Cloudflare API token**:
 - Hand-off pattern (never paste the token in chat): operator writes it to
   `trespies-poc/.cf-token` (already gitignored — confirm `git check-ignore` before anything), you read
   it for the API calls, operator rolls/deletes it after. It is ephemeral, not a shared credential.
+  Bitwarden alternative: `bws secret list` → the `cloudflare-api-token` entry. Note that the two
+  `cloudflare-deploy-token` entries currently in the vault fail `/user/tokens/verify` — use
+  `cloudflare-api-token`.
 - Verify it: `curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer $TOK"`
   → `success:true, status:active`.
 - **Cross-machine:** the Windows machine needs the same capability — there's a `notify` handoff
@@ -46,23 +51,55 @@ SLUG=<slug>
 # 1. create the project (wrangler pages deploy does NOT auto-create it)
 npx --yes wrangler pages project create "$SLUG" --production-branch=main
 
-# 2. deploy the folder (note the canonical *.pages.dev target it prints — may have a random suffix)
-npx --yes wrangler pages deploy "trespies-poc/$SLUG" --project-name="$SLUG" --branch=main --commit-dirty=true
+# 2. STAGE the folder, excluding dev docs (the #3 gotcha — see below)
+STAGE=$(mktemp -d)
+rsync -a \
+  --exclude='CLAUDE.md' --exclude='README.md' --exclude='AGENTS.md' \
+  --exclude='verify.sh'  --exclude='.git'     --exclude='.wrangler' \
+  --exclude='*.template.*' \
+  "trespies-poc/$SLUG/" "$STAGE/"
 
-# 3. attach the custom domain to the Pages project (REST — needs the API token)
+# 3. deploy the STAGED copy (note the canonical *.pages.dev target it prints — may have a random suffix)
+npx --yes wrangler pages deploy "$STAGE" --project-name="$SLUG" --branch=main --commit-dirty=true
+rm -rf "$STAGE"
+
+# 4. attach the custom domain to the Pages project (REST — needs the API token)
 curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/pages/projects/$SLUG/domains" \
   -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
   --data "{\"name\":\"$SLUG.trespies.dev\"}"
 
-# 4. CREATE THE DNS RECORD (the #2 gotcha — attach does NOT create it; without this it sits "pending" forever)
-#    proxied CNAME → the project's canonical *.pages.dev host from step 2 (e.g. contagion-86o.pages.dev)
+# 5. CREATE THE DNS RECORD (the #2 gotcha — attach does NOT create it; without this it sits "pending" forever)
+#    proxied CNAME → the project's canonical *.pages.dev host from step 3 (e.g. contagion-86o.pages.dev)
 curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
   -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
   --data "{\"type\":\"CNAME\",\"name\":\"$SLUG.trespies.dev\",\"content\":\"<project>.pages.dev\",\"proxied\":true}"
 ```
 
+## The #3 gotcha — `pages deploy <dir>` ships the whole directory
+
+There is no exclude flag. `wrangler pages deploy` has a small hard-coded ignore list
+(`_worker.js`, `_redirects`, `_headers`, `_routes.json`, `.DS_Store`, `node_modules`, `.git`) and
+nothing else. `.assetsignore` is documented for Workers-with-static-assets, **not** confirmed for
+classic Pages deploys — do not rely on it without testing it on a disposable project first.
+
+So when the deploy artifact *is* the source directory — which is the whole point of a zero-build
+stack — every dev doc goes public with it. Confirmed live: a deployed POC served its own `CLAUDE.md`
+and `README.md` at 200, and the `README.md` still carried three `https://example.com/` placeholder
+links a human would read.
+
+Staging via `rsync` is the fix: still zero-*build* (no bundler, no transpiler), just not zero-*script*.
+Deploy a copy, not the working tree.
+
+**Before the first deploy of any folder, check what would ship:**
+```bash
+find "trespies-poc/$SLUG" -type f -not -path '*/.git/*' | sort
+```
+Anything on that list is public. Decide deliberately, per file.
+
 ## Verify
 - `*.pages.dev` is live immediately: `curl -sI https://<project>.pages.dev` → 200.
+- **Confirm the exclusions actually held:** `curl -s -o /dev/null -w '%{http_code}' https://<project>.pages.dev/CLAUDE.md`
+  → expect `404`. A `200` means the stage step was skipped or the path was wrong.
 - Custom domain takes a few minutes (cert + DNS). The domain object goes `pending` → `active`; HTTPS
   passes through `522` (edge up, cert finalizing) → `200`.
 - **Local-DNS gotcha:** your own machine may keep a negative `NXDOMAIN` cache from before the record
@@ -71,6 +108,11 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
   `ip=$(dig +short <slug>.trespies.dev @1.1.1.1 | head -1); curl -sI --resolve "<slug>.trespies.dev:443:$ip" https://<slug>.trespies.dev`.
   To fix the local machine: `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` (needs the
   operator's sudo) or wait for the negative TTL.
+- **Stale-subresource gotcha:** a redeploy updates HTML immediately but a returning visitor can hold a
+  cached CSS/JS file from the previous deploy. If a fix spans HTML *and* a stylesheet, verify on the
+  unique `<hash>.<project>.pages.dev` deployment URL, where nothing is cached, before concluding it
+  failed. Anything that must never break — a visibility failsafe — belongs inline in the HTML, not in a
+  separately-cached file.
 - **Don't poll in the foreground.** Run a background watcher that loops the `--resolve` check until all
   domains return 200 (the harness re-invokes you on completion).
 
